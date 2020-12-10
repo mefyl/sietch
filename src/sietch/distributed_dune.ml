@@ -25,6 +25,11 @@ let make cache config = { cache; clients = Clients.empty; config }
 
 let debug = Dune_util.Log.info
 
+let digest_from_hex_exn h =
+  match Digest.from_hex h with
+  | None -> failwith "invalid hash"
+  | Some h -> h
+
 let connect t uri =
   let () =
     debug [ Pp.textf "connect to distributed backend %S" (Uri.to_string uri) ]
@@ -35,10 +40,36 @@ let connect t uri =
     |> async_ok
   in
   let* client =
+    let implementations =
+      let get () hash =
+        let hash = digest_from_hex_exn hash in
+        let path = Local.file_path t.cache hash |> Path.to_string in
+        let f () =
+          let ( let+ ) = Async.( >>| ) in
+          let ( and+ ) = Async.Deferred.both in
+          let+ stats = Async.Unix.stat path
+          and+ contents = Async.Reader.open_file path in
+          (stats.perm land 0o100 <> 0, Async.Reader.pipe contents)
+        in
+        Async.Deferred.map (Async.try_with f)
+          ~f:(Result.map_error ~f:(fun _ -> ()))
+      in
+      match
+        Async.Rpc.Implementations.create
+          ~implementations:
+            [ Async.Rpc.State_rpc.implement
+                Dune_distributed_storage.Rpc.block_get get
+            ]
+          ~on_unknown_rpc:`Raise
+      with
+      | Result.Ok impls -> impls
+      | Result.Error (`Duplicate_implementations _) ->
+        failwith "duplicate implementations"
+    in
     Async.( >>| )
       (Async.Rpc.Connection.create
          ~connection_state:(fun _ -> ())
-         reader writer)
+         ~implementations reader writer)
       (Result.map_error ~f:Core.Exn.to_string)
   in
   let* clients =
@@ -50,7 +81,7 @@ let connect t uri =
   let () = t.clients <- clients in
   Async.Deferred.Result.return client
 
-let client t target =
+let client_and_uri t target =
   let find_target target =
     let f node = Config.ranges_include node.Config.space target in
     match List.find t.config.nodes ~f with
@@ -61,27 +92,30 @@ let client t target =
            (Digest.to_string target))
   in
   let* uri = find_target target |> Async.return in
-  match Clients.find t.clients uri with
-  | Some client -> Async.Deferred.Result.return client
-  | None -> connect t uri
+  let+ client =
+    match Clients.find t.clients uri with
+    | Some client -> Async.Deferred.Result.return client
+    | None -> connect t uri
+  in
+  (client, uri)
+
+let client t target = client_and_uri t target >>| fst
 
 let block_get t hash =
   let* client = client t hash in
-  Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.block_get client
+  let ( >>= ) = Async.( >>= ) in
+  Async.Rpc.State_rpc.dispatch Dune_distributed_storage.Rpc.block_get client
     (Digest.to_string hash)
-  |> async_ok
-
-let block_has t hash =
-  let* client = client t hash in
-  Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.block_has client
-    (Digest.to_string hash)
-  |> async_ok
-
-let block_put t hash executable contents =
-  let* client = client t hash in
-  Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.block_put client
-    (Digest.to_string hash, executable, contents)
-  |> async_ok
+  >>= function
+  | Result.Ok (Result.Ok (executable, contents, _)) ->
+    Async.Deferred.Result.return (executable, contents)
+  | Result.Error e ->
+    Async.Deferred.Result.fail
+      (Fmt.str "unable to fetch %s: %s" (Digest.to_string hash)
+         (Core.Error.to_string_hum e))
+  | Result.Ok (Result.Error ()) ->
+    Async.Deferred.Result.fail
+      (Fmt.str "unable to fetch %s" (Digest.to_string hash))
 
 let index_get t name hash =
   let* client = client t hash in
@@ -95,45 +129,36 @@ let index_put t name hash lines =
     (name, Digest.to_string hash, lines)
   |> async_ok
 
-let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
-    =
-  let f () =
-    let* () =
-      match metadata.contents with
-      | Files files ->
-        let insert_file { Cache.File.digest; _ } =
-          let path = Local.file_path cache digest in
-          let insert stats input =
-            let executable = stats.Unix.st_perm land 0o100 > 0 in
-            let* contents = Async.Reader.contents input |> async_ok in
-            block_put t digest executable contents
-          in
-          let stats = Path.stat path in
-          let* upload =
-            if stats.st_size < 4096 then
-              Async.Deferred.Result.return true
-            else
-              block_has t digest
-          in
-          if upload then
-            let path = Path.to_string path in
-            let () = debug [ Pp.textf "distribute %S" path ] in
-            Async.Reader.with_file path ~f:(insert stats)
-          else
-            Async.Deferred.Result.return ()
-        in
-        let ( let* ) = Async.Deferred.( >>= ) in
-        let* results =
-          Async.Deferred.List.map ~how:(`Max_concurrent_jobs 8) ~f:insert_file
-            files
-        in
-        let ( let* ) = Async.Deferred.Result.( >>= ) in
-        let* (_ : unit list) = results |> Result.List.all |> Async.return in
-        Async.Deferred.Result.return ()
-      | Value _ -> Async.Deferred.Result.fail "ignoring Jenga value"
+let metadata_put t hash (metadata : Cache.Local.Metadata_file.t) =
+  (* Determine all nodes we need to upload metadata to *)
+  let* targets =
+    let ( let* ) = Async.( >>= ) in
+    let* init =
+      (* Send metadata to the node that will actually store it *)
+      let+ client, uri = client_and_uri t hash in
+      Clients.set Clients.empty uri client
     in
-    block_put t key false (Cache.Local.Metadata_file.to_string metadata)
+    match metadata.contents with
+    | Value _ -> Async.Deferred.return init
+    | Files files ->
+      (* Send metadata to all nodes that must store one of its artifacts *)
+      let f init { Cache.File.digest; _ } =
+        match init with
+        | Result.Ok init ->
+          let+ client, uri = client_and_uri t digest in
+          Clients.set init uri client
+        | Result.Error e -> Async.Deferred.Result.fail e
+      in
+      Async.Deferred.List.fold ~f ~init files
   in
+  let f (_, client) =
+    Async.Rpc.Rpc.dispatch_exn Dune_distributed_storage.Rpc.metadata_put client
+      (Digest.to_string hash, Cache.Local.Metadata_file.to_string metadata)
+  in
+  Async.Deferred.List.iter ~f (Clients.to_list targets) |> async_ok
+
+let distribute t key (metadata : Cache.Local.Metadata_file.t) =
+  let f () = metadata_put t key metadata in
   let ( >>| ) = Async.Deferred.( >>| ) in
   Async.try_with ~extract_exn:true f >>| function
   | Result.Ok v -> v
@@ -142,61 +167,80 @@ let distribute ({ cache; _ } as t) key (metadata : Cache.Local.Metadata_file.t)
 
 let prefetch ({ cache; _ } as t) count i key =
   let f () =
+    let hash = Digest.to_string key in
     let local_path = Local.metadata_path cache key in
     if Path.exists local_path then
-      debug
-        [ Pp.textf "metadata file already present locally: %s"
-            (Path.to_string local_path)
-        ]
+      debug [ Pp.textf "metadata %s: already present locally" hash ]
       |> Async.Deferred.Result.return
     else
-      let hash = Digest.to_string key in
       let () = debug [ Pp.textf "fetch metadata %s (%i/%i)" hash i count ] in
-      block_get t key >>= function
-      | None -> Async.Deferred.Result.return ()
-      | Some (metadata_contents, _) -> (
-        let* metadata =
-          Cache.Local.Metadata_file.of_string metadata_contents |> Async.return
-        in
-        match metadata.contents with
-        | Files files ->
-          let fetch { Cache.File.digest; _ } =
-            let path = Local.file_path cache digest in
-            if Path.exists local_path then
+      let* _, metadata_contents = block_get t key in
+      let* metadata_contents =
+        Async.Pipe.fold ~init:""
+          ~f:(fun l r -> Async.return (l ^ r))
+          metadata_contents
+        |> async_ok
+      in
+      let* metadata =
+        Cache.Local.Metadata_file.of_string metadata_contents |> Async.return
+      in
+      match metadata.contents with
+      | Files files ->
+        let fetch { Cache.File.digest; _ } =
+          let path = Local.file_path cache digest in
+          if Path.exists path then
+            let+ () =
               debug
                 [ Pp.textf "artifact already present locally: %s"
-                    (Path.to_string local_path)
+                    (Path.to_string path)
                 ]
               |> Async.Deferred.Result.return
-            else
-              let () =
-                debug [ Pp.textf "fetch artifact %s" (Digest.to_string digest) ]
-              in
-              block_get t digest >>= function
-              | None -> Async.Deferred.Result.return ()
-              | Some (contents, executable) ->
-                let perm =
-                  if executable then
-                    0o500
-                  else
-                    0o400
-                in
-                Async.Writer.with_file_atomic ~perm (Path.to_string path)
-                  ~f:(fun writer ->
-                    let () = Async.Writer.write writer contents in
-                    Async.Writer.flushed writer)
-                |> async_ok
-          in
-          let ( let* ) = Async.Deferred.( >>= ) in
-          let* results = Async.Deferred.List.all @@ List.map ~f:fetch files in
-          let ( let* ) = Async.Deferred.Result.( >>= ) in
-          let* (_ : unit list) = results |> Result.List.all |> Async.return in
-          write_file cache local_path false metadata_contents
-        | Value h ->
-          let () =
-            debug [ Pp.textf "skipping Jenga value: %s" (Digest.to_string h) ]
-          in
-          Async.Deferred.Result.return () )
+            in
+            false
+          else
+            let () =
+              debug [ Pp.textf "fetch artifact %s" (Digest.to_string digest) ]
+            in
+            let* executable, contents = block_get t digest in
+            let f writer =
+              Async.Pipe.transfer ~f:Core.Fn.id contents
+                (Async.Writer.pipe writer)
+            in
+            write_file cache path executable ~f
+        in
+        let ( let* ) = Async.Deferred.( >>= ) in
+        let* results = Async.Deferred.List.all @@ List.map ~f:fetch files in
+        let ( let* ) = Async.Deferred.Result.( >>= ) in
+        let* results = results |> Result.List.all |> Async.return in
+        let+ result_metadata =
+          write_file cache local_path false ~f:(fun writer ->
+              Async.return @@ Async.Writer.write writer metadata_contents)
+        in
+        if result_metadata then
+          debug [ Pp.textf "metadata %s: rule was built in the meantime" hash ]
+        else
+          let count =
+            List.fold_left ~init:0
+              ~f:(fun a b ->
+                if b then
+                  a + 1
+                else
+                  a)
+              results
+          and length = List.length results in
+          if count = length then
+            debug
+              [ Pp.textf "metadata %s: all %i artifacts downloaded" hash count ]
+          else
+            debug
+              [ Pp.textf "metadata %s: %i / %i artifacts downloaded" hash count
+                  length
+              ]
+      | Value h ->
+        let () =
+          debug [ Pp.textf "skipping Jenga value: %s" (Digest.to_string h) ]
+        in
+        Async.Deferred.Result.return ()
   in
   let ( >>| ) = Async.Deferred.( >>| ) in
   Async.try_with ~extract_exn:true f >>| function
@@ -217,6 +261,9 @@ let index_prefetch t name key =
   let f () =
     index_get t name key >>= function
     | Some lines ->
+      let () =
+        debug [ Pp.textf "prefetch up to %d artifacts" (List.length lines) ]
+      in
       let keys = List.filter_map ~f:(fun d -> Digest.from_hex d) lines in
       let count = List.length keys in
       let ( let* ) = Async.Deferred.( >>= ) in
@@ -248,9 +295,7 @@ let index_prefetch t name key =
 
 let make config local =
   ( module struct
-    let v =
-      let local = Local.make local in
-      make local config
+    let v = make local config
 
     let distribute = distribute v
 
